@@ -1,0 +1,25 @@
+$ErrorActionPreference = "Stop"
+
+Remove-Item -Recurse -Force .\build, .\dist, .\CashInPOS.spec -ErrorAction SilentlyContinue
+
+# Build onedir
+python -m PyInstaller --noconfirm --clean --windowed `
+  --name "CashInPOS" `
+  --add-data "icons;icons" `
+  login_page.py
+
+$release = ".\CashIn"
+Remove-Item -Recurse -Force $release -ErrorAction SilentlyContinue
+New-Item -ItemType Directory -Path $release -Force | Out-Null
+
+# Copy the WHOLE onedir output (contains python313.dll etc.)
+Copy-Item ".\dist\CashInPOS\*" $release -Recurse -Force
+
+# Create your extra folders beside the exe
+New-Item -ItemType Directory -Path "$release\data"  -Force | Out-Null
+New-Item -ItemType Directory -Path "$release\tools" -Force | Out-Null
+
+Copy-Item ".\data\cashflow.db" "$release\data\cashflow.db" -Force
+Copy-Item ".\tools\SumatraPDF.exe" "$release\tools\SumatraPDF.exe" -Force
+
+Write-Host "DONE -> $release\CashInPOS.exe + $release\_internal\... + $release\data\cashflow.db + $release\tools\SumatraPDF.exe"
