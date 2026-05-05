@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QApplication,
     QToolTip,
+    QLineEdit, 
 )
 from PySide6.QtCore import Qt, QDate, QSize
 from PySide6.QtGui import QCursor, QIcon
@@ -44,28 +45,27 @@ def app_icon(name: str) -> QIcon:
 class EditPaymentDialog(AddPaymentDialog):
     """
     Reuse AddPaymentDialog UI to edit an existing payment.
+    Invoice selection stays locked to the original invoice, while the
+    payment amount and payment date remain editable.
     """
 
     def __init__(self, db_conn: sqlite3.Connection, payment_id: int, parent=None):
         self.payment_id = payment_id
         super().__init__(db_conn, parent)
 
-        # change title
         title_lbl = self.findChild(QLabel, "DialogTitle")
         if title_lbl:
             title_lbl.setText("Edit Payment")
 
-        # change primary button text
         for btn in self.findChildren(QPushButton):
             if btn.objectName() == "DialogPrimaryButton":
                 btn.setText("Save")
                 break
 
-        # load existing data
         self._load_payment_data()
-        self.edit_invoice_code.setReadOnly(True)
-        self.edit_invoice_code.setCursor(Qt.ArrowCursor)
 
+        self.combo_order_booker.setEnabled(False)
+        self.edit_invoice_code.setEnabled(False)
 
     def _load_payment_data(self):
         """Populate fields from DB for the given payment_id."""
@@ -81,6 +81,7 @@ class EditPaymentDialog(AddPaymentDialog):
                     i.invoice_code,
                     i.invoice_date,
                     i.amount AS invoice_amount,
+                    i.order_booker_id,
                     c.name AS customer_name,
                     ob.name AS ob_name,
                     pj.pjp_name
@@ -99,11 +100,7 @@ class EditPaymentDialog(AddPaymentDialog):
                 self.reject()
                 return
         except Exception as e:
-            QMessageBox.critical(
-                self,
-                "Error",
-                f"Failed to load payment:\n\n{e}",
-            )
+            QMessageBox.critical(self, "Error", f"Failed to load payment:\n\n{e}")
             self.reject()
             return
 
@@ -111,35 +108,26 @@ class EditPaymentDialog(AddPaymentDialog):
             payment_code = row["payment_code"]
             payment_date = row["payment_date"]
             amount = row["amount"]
+            invoice_id = row["invoice_id"]
             invoice_code = row["invoice_code"]
             invoice_date = row["invoice_date"]
             invoice_amount = row["invoice_amount"]
-            customer_name = row["customer_name"] or "-"
-            ob_name = row["ob_name"] or "-"
-            pjp_name = row["pjp_name"] or "-"
+            order_booker_id = row["order_booker_id"]
         else:
             (
                 payment_code,
                 payment_date,
                 amount,
-                _invoice_id,
+                invoice_id,
                 invoice_code,
                 invoice_date,
                 invoice_amount,
-                customer_name,
-                ob_name,
-                pjp_name,
+                order_booker_id,
+                _customer_name,
+                _ob_name,
+                _pjp_name,
             ) = row
-            customer_name = customer_name or "-"
-            ob_name = ob_name or "-"
-            pjp_name = pjp_name or "-"
 
-        if hasattr(self, "edit_invoice_amount"):
-            self.edit_invoice_amount.setText(f"{float(invoice_amount or 0):,.0f}")
-
-
-
-        # fill fields
         self.edit_payment_code.setText(str(payment_code) if payment_code is not None else "")
 
         try:
@@ -148,30 +136,53 @@ class EditPaymentDialog(AddPaymentDialog):
         except Exception:
             self.date_payment.setDate(QDate.currentDate())
 
-        self.edit_invoice_code.setText(str(invoice_code) if invoice_code is not None else "")
-
-        # invoice date
-        try:
-            dt_inv = datetime.strptime(invoice_date, "%Y-%m-%d")
-            self.edit_invoice_date.setText(
-                QDate(dt_inv.year, dt_inv.month, dt_inv.day).toString("dd/MM/yyyy")
-            )
-        except Exception:
-            self.edit_invoice_date.setText(invoice_date or "")
-
-        self.edit_customer.setText(customer_name)
-        self.edit_ob.setText(ob_name)
-        self.edit_pjp.setText(pjp_name)
+        self._load_order_bookers(selected_order_booker_id=order_booker_id)
+        self._load_invoices_for_order_booker(order_booker_id, selected_invoice_id=invoice_id)
+        self._populate_invoice_fields(invoice_id)
 
         if amount is not None:
             self.edit_amount.setText(str(amount))
 
 
+    def _load_invoices_for_order_booker(self, order_booker_id: int | None, selected_invoice_id: int | None = None):
+        """Set the locked invoice field for edit mode."""
+        self._current_invoice_id = selected_invoice_id
+
+        if not hasattr(self, "edit_invoice_code"):
+            return
+
+        try:
+            self.edit_invoice_code.clear()
+
+            if not selected_invoice_id:
+                return
+
+            cur = self.conn.cursor()
+            cur.execute(
+                """
+                SELECT invoice_code
+                FROM invoices
+                WHERE id = ?
+                """,
+                (selected_invoice_id,),
+            )
+            row = cur.fetchone()
+
+            if not row:
+                return
+
+            if isinstance(row, sqlite3.Row):
+                invoice_code = row["invoice_code"]
+            else:
+                invoice_code = row[0]
+
+            self.edit_invoice_code.setText(str(invoice_code or ""))
+
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to load invoice:\n\n{e}")
+
+            
     def _invoice_payment_totals_excluding_self(self, invoice_id: int) -> tuple[float, float]:
-        """
-        Returns (invoice_amount, total_paid_excluding_this_payment)
-        so edits don't count the current payment twice.
-        """
         cur = self.conn.cursor()
 
         cur.execute("SELECT amount FROM invoices WHERE id = ?", (invoice_id,))
@@ -187,16 +198,21 @@ class EditPaymentDialog(AddPaymentDialog):
 
         return inv_amt, paid_amt
 
+    def _populate_invoice_fields(self, invoice_id: int):
+        super()._populate_invoice_fields(invoice_id)
+        remaining = 0.0
+        if invoice_id:
+            remaining = max(self._invoice_payment_totals_excluding_self(invoice_id)[0] - self._invoice_payment_totals_excluding_self(invoice_id)[1], 0.0)
+        self.edit_remaining_amount.setText(f"{remaining:,.0f}")
+        self._current_remaining_amount = remaining
 
-    # override AddPaymentDialog save handler
     def _on_add_clicked(self):
-        invoice_code_str = self._normalize_numeric_code(self.edit_invoice_code.text())
-        invoice_code = int(invoice_code_str) if invoice_code_str.isdigit() else None
+        invoice_id = self._current_invoice_id
         payment_date_iso = self.date_payment.date().toString("yyyy-MM-dd")
         amount_text = self.edit_amount.text().strip()
         amount = float(amount_text) if amount_text else 0.0
 
-        if not invoice_code or amount <= 0:
+        if not invoice_id or amount <= 0:
             QMessageBox.warning(
                 self,
                 "Validation error",
@@ -204,23 +220,7 @@ class EditPaymentDialog(AddPaymentDialog):
             )
             return
 
-        # resolve invoice_id
         try:
-            cur = self.conn.cursor()
-            cur.execute(
-                "SELECT id FROM invoices WHERE invoice_code = ?",
-                (invoice_code,),
-            )
-            row = cur.fetchone()
-            if not row:
-                QMessageBox.warning(
-                    self,
-                    "Validation error",
-                    "No invoice found with this Invoice ID.",
-                )
-                return
-            invoice_id = row["id"] if isinstance(row, sqlite3.Row) else row[0]
-            # ---- prevent extra payment if invoice already fully paid / overpayment (edit-safe) ----
             inv_amt, paid_amt = self._invoice_payment_totals_excluding_self(invoice_id)
 
             if inv_amt > 0 and paid_amt >= inv_amt:
@@ -244,18 +244,15 @@ class EditPaymentDialog(AddPaymentDialog):
                 return
 
         except Exception as e:
-            QMessageBox.critical(
-                self,
-                "Error",
-                f"Failed to look up invoice:\n\n{e}",
-            )
+            QMessageBox.critical(self, "Error", f"Failed to validate invoice:\n\n{e}")
             return
 
-        payment_code_str = self._normalize_numeric_code(self.edit_payment_code.text())
-        if not payment_code_str.isdigit():
-            QMessageBox.warning(self, 'Validation error', 'Payment ID must be numeric (e.g., 1, 2, 3...).')
+        payment_code_text = self.edit_payment_code.text().strip()
+        if not payment_code_text.isdigit():
+            QMessageBox.warning(self, "Validation error", "Payment ID must be numeric (e.g., 1, 2, 3...).")
             return
-        payment_code = int(payment_code_str)
+
+        payment_code = int(payment_code_text)
         try:
             cur = self.conn.cursor()
             cur.execute(
@@ -278,11 +275,7 @@ class EditPaymentDialog(AddPaymentDialog):
             )
             return
         except Exception as e:
-            QMessageBox.critical(
-                self,
-                "Error",
-                f"Failed to update payment:\n\n{e}",
-            )
+            QMessageBox.critical(self, "Error", f"Failed to update payment:\n\n{e}")
             return
 
         self.accept()
@@ -523,6 +516,7 @@ class ManagePaymentsDialog(QDialog):
         self._is_loading = False
         self._total_count = 0
         self._total_amount = 0.0
+        self._search_payment_code = ""
 
         self._build_ui()
         self._apply_styles()
@@ -545,10 +539,20 @@ class ManagePaymentsDialog(QDialog):
 
         title_text = "Edit Payments" if self.mode == "edit" else "Manage Payments"
         title = QLabel(title_text)
-
         title.setObjectName("PaymentsTitle")
         h_layout.addWidget(title)
+
         h_layout.addStretch()
+
+        self.edit_search = QLineEdit()
+        self.edit_search.setObjectName("PaymentSearch")
+        self.edit_search.setPlaceholderText("Search Payment ID")
+        self.edit_search.setClearButtonEnabled(True)
+        self.edit_search.setFixedWidth(220)
+        self.edit_search.returnPressed.connect(self._apply_search)
+        self.edit_search.textChanged.connect(self._on_search_text_changed)
+
+        h_layout.addWidget(self.edit_search)
 
         main_layout.addWidget(header)
 
@@ -613,6 +617,9 @@ class ManagePaymentsDialog(QDialog):
         self.btn_add_payment.setObjectName("AddPaymentBtn")
         self.btn_add_payment.setCursor(QCursor(Qt.PointingHandCursor))
         self.btn_add_payment.clicked.connect(self.add_payment)
+
+        self.btn_add_payment.setDefault(False)
+        self.btn_add_payment.setAutoDefault(False)
 
         self.btn_delete_selected = QPushButton("Delete Selected")
         self.btn_delete_selected.setObjectName("DeleteSelectedBtn")
@@ -755,23 +762,41 @@ class ManagePaymentsDialog(QDialog):
         self._has_more = True
         self._is_loading = False
 
+    def _normalize_payment_search(self, text: str) -> str:
+        return "".join(ch for ch in (text or "").strip() if ch.isdigit())
+
+    def _apply_search(self):
+        self._search_payment_code = self._normalize_payment_search(self.edit_search.text())
+        self.load_payments()
+
+    def _on_search_text_changed(self, text: str):
+        if not (text or "").strip():
+            self._search_payment_code = ""
+            self.load_payments()
+
     def _ledger_flag(self) -> int:
         """Return which ledger state this dialog is currently browsing."""
         return 0 if getattr(self, "mode", "edit") == "edit" else 1
 
     def _compute_totals(self) -> tuple[int, float]:
-        """Return (count, sum_amount) for current ledger flag without joins."""
         ledger_flag = self._ledger_flag()
         query = "SELECT COUNT(*) AS cnt, COALESCE(SUM(amount), 0) AS total_amount FROM payments WHERE in_ledger = ?"
+        params = [ledger_flag]
+
+        if self._search_payment_code:
+            query += " AND CAST(payment_code AS TEXT) = ?"
+            params.append(self._search_payment_code)
+
         try:
             cur = self.conn.cursor()
-            cur.execute(query, (ledger_flag,))
+            cur.execute(query, params)
             r = cur.fetchone()
             cnt = int(r["cnt"] or 0) if r else 0
             total = float(r["total_amount"] or 0) if r else 0.0
             return cnt, total
         except Exception:
             return 0, 0.0
+        
 
     def _fetch_payment_page(self, cursor_key):
         """Fetch one page using keyset pagination."""
@@ -795,8 +820,13 @@ class ManagePaymentsDialog(QDialog):
             LEFT JOIN pjps pj ON pj.id = i.pjp_id
             LEFT JOIN order_bookers ob ON ob.id = pj.order_booker_id
             WHERE p.in_ledger = ?
+
         """
         params = [ledger_flag]
+
+        if self._search_payment_code:
+            query += " AND CAST(p.payment_code AS TEXT) = ?"
+            params.append(self._search_payment_code)
 
         sort_mode = getattr(self, "sort_mode", "newest")
 

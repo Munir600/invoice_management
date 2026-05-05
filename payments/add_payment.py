@@ -1,6 +1,5 @@
 # payments/add_payment.py
 import sqlite3
-import os
 from datetime import datetime
 
 from PySide6.QtWidgets import (
@@ -14,27 +13,45 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QWidget,
     QDateEdit,
+    QComboBox,
 )
-from PySide6.QtCore import Qt, QDate, Signal, QTimer
-from PySide6.QtGui import QDoubleValidator
+from PySide6.QtCore import Qt, QDate, Signal, QTimer, QPoint
+from PySide6.QtGui import QDoubleValidator, QIntValidator, QPainter, QPolygon, QColor
 
-# --------------------------------------------------------------------
-#  AddPaymentDialog
-# --------------------------------------------------------------------
 
+class ArrowComboBox(QComboBox):
+    def paintEvent(self, event):
+        super().paintEvent(event)
+
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        arrow_color = QColor("#e5e7eb") if self.palette().color(self.foregroundRole()).lightness() < 180 else QColor("#374151")
+        painter.setBrush(arrow_color)
+        painter.setPen(Qt.NoPen)
+
+        x = self.width() - 18
+        y = self.height() // 2 - 1
+        triangle = QPolygon([
+            QPoint(x - 5, y - 2),
+            QPoint(x + 5, y - 2),
+            QPoint(x, y + 4),
+        ])
+        painter.drawPolygon(triangle)
 
 class AddPaymentDialog(QDialog):
     """
     Dialog for adding a new Payment.
 
-    Behavior:
-      - User types an Invoice ID.
-      - Real-time lookup fills details.
-      - Payment ID is auto-generated based on Invoice ID.
-      - On "Add": Saves to DB, shows success banner, clears form, keeps dialog open.
+    New behavior:
+      - Order Booker is the first selectable field and opens automatically.
+      - Invoice ID is a dropdown filtered by the selected Order Booker.
+      - Selecting a valid invoice auto-fills customer, PJP, invoice amount,
+        remaining amount, and invoice date.
+      - After a successful add, the full form resets for the next entry.
+      - Reopening the dialog also resets any previous typed/selected values.
     """
 
-    # Signal emitted when a payment is successfully added
     payment_added = Signal()
 
     def __init__(self, db_conn: sqlite3.Connection, parent: QWidget | None = None):
@@ -44,87 +61,79 @@ class AddPaymentDialog(QDialog):
             parent.dark_mode if parent and hasattr(parent, "dark_mode") else False
         )
 
-        # state for current invoice lookup
         self._current_invoice_id: int | None = None
         self._current_invoice_amount: float = 0.0
+        self._current_remaining_amount: float = 0.0
+        self._invoice_resolved = False
+        self._did_first_show_reset = False
+
+        self._sticky_order_booker_id: int | None = None
 
         self.setWindowTitle("Add Payment")
 
         self._build_ui()
-        # Enter in amount -> submit
-        self.edit_amount.returnPressed.connect(self._on_add_clicked)
-
-        QTimer.singleShot(0, self.edit_invoice_code.setFocus)
         self._apply_local_styles()
-
-        # connect real-time lookup for invoice code
-        self.edit_invoice_code.textChanged.connect(self._on_invoice_code_changed)
-
         self._preview_next_payment_id()
 
-        # Let Qt pick a natural size first
+        self.edit_amount.returnPressed.connect(self._on_add_clicked)
+        self.combo_order_booker.currentIndexChanged.connect(self._on_order_booker_changed)
+        self.edit_invoice_code.textChanged.connect(self._on_invoice_code_changed)
+        self.edit_invoice_code.editingFinished.connect(lambda: self._resolve_invoice_from_input(show_error=False))
+        self.edit_invoice_code.returnPressed.connect(lambda: self._resolve_invoice_from_input(show_error=True))
+
         self.adjustSize()
-
-        # Make the dialog a bit smaller so it fits nicely
-        max_height = 520          # reduce if you still feel it is tall
-        min_width  = 780          # wide enough, but not huge
-
-        width  = max(min_width, self.width())
+        max_height = 560
+        min_width = 820
+        width = max(min_width, self.width())
         height = min(self.height(), max_height)
         self.resize(width, height)
 
-        # When opened from Manage Payments, place it next to that window
         self._position_next_to_parent()
-        self._invoice_resolved = False
 
-        # Enter in invoice id -> jump to amount if valid
-        self.edit_invoice_code.returnPressed.connect(self._jump_to_amount_if_valid)
+    # --------------------------- lifecycle ---------------------------
 
+    def showEvent(self, event):
+        super().showEvent(event)
+        if self.__class__ is AddPaymentDialog:
+            # Fresh open -> do not preserve previous Order Booker
+            self._sticky_order_booker_id = None
+            self.reset_form(auto_open_order_booker=True, preserve_order_booker=False)
+        else:
+            self._position_next_to_parent()
 
-    def _jump_to_amount_if_valid(self):
-        if not self._invoice_resolved or not self._current_invoice_id:
-            QMessageBox.warning(self, "Validation error", "Please enter a valid Invoice ID first.")
-            self.edit_invoice_code.setFocus()
-            self.edit_invoice_code.selectAll()
-            return
+    def reject(self):
+        if self.__class__ is AddPaymentDialog:
+            # When dialog closes, forget preserved Order Booker
+            self._sticky_order_booker_id = None
+            self.reset_form(auto_open_order_booker=False, preserve_order_booker=False)
+        super().reject()
 
+    # --------------------------- helpers ---------------------------
+
+    def _focus_payment_amount(self):
         self.edit_amount.setFocus()
         self.edit_amount.selectAll()
 
-
     def _position_next_to_parent(self):
-        """
-        Position this dialog side-by-side with its parent dialog (Manage Invoices)
-        instead of centered on top of it.
-        """
         parent = self.parent()
         if parent is None or not parent.isVisible():
             return
 
         parent_geom = parent.frameGeometry()
-
-        # Use the same screen as the parent if possible
         screen = parent.screen() or self.screen()
-        if screen is not None:
-            avail = screen.availableGeometry()
-        else:
-            avail = parent_geom
+        avail = screen.availableGeometry() if screen is not None else parent_geom
 
-        # Try to place to the right of parent
         x_right = parent_geom.x() + parent_geom.width()
         new_x = x_right
         new_y = parent_geom.y()
 
-        # If there is not enough space on the right, place to the left
         if new_x + self.width() > avail.right():
             new_x = max(avail.left(), parent_geom.x() - self.width() - 10)
 
-        # Clamp vertical position within screen
         if new_y + self.height() > avail.bottom():
             new_y = max(avail.top(), avail.bottom() - self.height())
 
         self.move(new_x, new_y)
-
 
     def _show_success_banner(self, message: str):
         notification = QLabel(message, self)
@@ -134,40 +143,73 @@ class AddPaymentDialog(QDialog):
         )
         notification.setAlignment(Qt.AlignCenter)
 
-        # Size and position: top-center of this dialog window
         width = notification.sizeHint().width() + 20
         height = notification.sizeHint().height()
         notification.setFixedSize(width, height)
 
         x = (self.width() - width) // 2
-        y = 20  # a bit from the top of the dialog
+        y = 20
         notification.move(x, y)
-
-        notification.raise_()  # ensure it’s above all child widgets
+        notification.raise_()
         notification.show()
 
         QTimer.singleShot(2000, notification.deleteLater)
 
-    # --------------------------- UI ---------------------------
-
-
     def _preview_next_payment_id(self):
-        
         try:
             cur = self.conn.cursor()
             cur.execute("SELECT value FROM payment_meta WHERE key = 'payment_last_number'")
-            last_no = cur.fetchone()[0]
-            self.edit_payment_code.setText(str(last_no + 1))
+            row = cur.fetchone()
+            last_no = row[0] if row else 0
+            self.edit_payment_code.setText(str(int(last_no) + 1))
         except Exception:
-            pass
+            self.edit_payment_code.clear()
 
+    def _open_order_booker_dropdown(self):
+        if self.combo_order_booker.count() > 1:
+            self.combo_order_booker.setFocus()
+            QTimer.singleShot(0, self.combo_order_booker.showPopup)
+        else:
+            self.combo_order_booker.setFocus()
+
+    def _focus_invoice_input(self):
+        self.edit_invoice_code.setFocus()
+        self.edit_invoice_code.selectAll()
+
+    def reset_form(
+        self,
+        auto_open_order_booker: bool = True,
+        preserve_order_booker: bool = False,
+    ):
+        self._invoice_resolved = False
+        self._current_invoice_id = None
+        self._current_invoice_amount = 0.0
+        self._current_remaining_amount = 0.0
+
+        self._preview_next_payment_id()
+        self.date_payment.setDate(QDate.currentDate())
+        self.edit_amount.clear()
+
+        selected_order_booker_id = (
+            self._sticky_order_booker_id if preserve_order_booker else None
+        )
+
+        self._load_order_bookers(selected_order_booker_id=selected_order_booker_id)
+        self._clear_invoice_fields()
+
+        if selected_order_booker_id is not None:
+            if auto_open_order_booker:
+                QTimer.singleShot(0, self._focus_invoice_input)
+        else:
+            if auto_open_order_booker:
+                QTimer.singleShot(0, self._open_order_booker_dropdown)
+    # --------------------------- UI ---------------------------
 
     def _build_ui(self):
         main_layout = QVBoxLayout(self)
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
 
-        # ---- Header ----
         header = QFrame()
         header_layout = QHBoxLayout(header)
         header_layout.setContentsMargins(20, 16, 20, 16)
@@ -177,47 +219,37 @@ class AddPaymentDialog(QDialog):
         title_label.setObjectName("DialogTitle")
         header_layout.addWidget(title_label, alignment=Qt.AlignCenter)
         header_layout.addStretch()
-
         main_layout.addWidget(header)
 
-        # Separator
         sep = QFrame()
         sep.setFrameShape(QFrame.HLine)
         sep.setFrameShadow(QFrame.Sunken)
         main_layout.addWidget(sep)
 
-        # ---- Body ----
         body = QFrame()
         body_layout = QVBoxLayout(body)
         body_layout.setContentsMargins(20, 16, 20, 16)
         body_layout.setSpacing(16)
 
-        # =========== ROW 1: Payment ID | Payment Date ===========
+        # Row 1: Payment ID | Payment Date
         row1 = QHBoxLayout()
         row1.setSpacing(12)
 
-        # Payment ID
         col_pay_code = QVBoxLayout()
         lbl_pay_code = QLabel("Payment ID")
-        lbl_pay_code.setCursor(Qt.PointingHandCursor)
         self.edit_payment_code = QLineEdit()
         self.edit_payment_code.setReadOnly(True)
-        self.edit_payment_code.setPlaceholderText("Auto-generated from Invoice ID")
         self.edit_payment_code.setMinimumHeight(36)
-        self.edit_payment_code.setCursor(Qt.ArrowCursor)
         col_pay_code.addWidget(lbl_pay_code)
         col_pay_code.addWidget(self.edit_payment_code)
 
-        # Payment Date
         col_pay_date = QVBoxLayout()
         lbl_pay_date = QLabel("Payment Date")
-        lbl_pay_date.setCursor(Qt.PointingHandCursor)
         self.date_payment = QDateEdit()
         self.date_payment.setCalendarPopup(True)
         self.date_payment.setDisplayFormat("dd/MM/yyyy")
         self.date_payment.setDate(QDate.currentDate())
         self.date_payment.setMinimumHeight(36)
-        self.date_payment.setCursor(Qt.PointingHandCursor)
         col_pay_date.addWidget(lbl_pay_date)
         col_pay_date.addWidget(self.date_payment)
 
@@ -225,122 +257,110 @@ class AddPaymentDialog(QDialog):
         row1.addLayout(col_pay_date, 1)
         body_layout.addLayout(row1)
 
-        # =========== ROW 2: Invoice ID | Invoice Date ===========
+        # Row 2: Invoice ID | Order Booker
         row2 = QHBoxLayout()
         row2.setSpacing(12)
 
-        # Invoice ID (user types)
         col_inv_code = QVBoxLayout()
         lbl_inv_code = QLabel("Invoice ID")
-        lbl_inv_code.setCursor(Qt.PointingHandCursor)
         self.edit_invoice_code = QLineEdit()
-        self.edit_invoice_code.setPlaceholderText("Enter Invoice ID (e.g. 1,2,3)")
+        self.edit_invoice_code.setPlaceholderText("Enter Invoice ID")
         self.edit_invoice_code.setMinimumHeight(36)
-        self.edit_invoice_code.setCursor(Qt.PointingHandCursor)
+        self.edit_invoice_code.setValidator(QIntValidator(1, 999999999, self))
         col_inv_code.addWidget(lbl_inv_code)
         col_inv_code.addWidget(self.edit_invoice_code)
 
-        # Invoice Date (auto, read-only)
-        col_inv_date = QVBoxLayout()
-        lbl_inv_date = QLabel("Invoice Date")
-        lbl_inv_date.setCursor(Qt.PointingHandCursor)
-        self.edit_invoice_date = QLineEdit()
-        self.edit_invoice_date.setReadOnly(True)
-        self.edit_invoice_date.setMinimumHeight(36)
-        self.edit_invoice_date.setCursor(Qt.ArrowCursor)
-        col_inv_date.addWidget(lbl_inv_date)
-        col_inv_date.addWidget(self.edit_invoice_date)
+        col_ob = QVBoxLayout()
+        lbl_ob = QLabel("Order Booker")
+        self.combo_order_booker = ArrowComboBox()
+        self.combo_order_booker.setMinimumHeight(36)
+        self.combo_order_booker.setInsertPolicy(QComboBox.NoInsert)
+        self.combo_order_booker.setFocusPolicy(Qt.StrongFocus)
+        self.combo_order_booker.setCursor(Qt.PointingHandCursor)
+        col_ob.addWidget(lbl_ob)
+        col_ob.addWidget(self.combo_order_booker)
 
         row2.addLayout(col_inv_code, 1)
-        row2.addLayout(col_inv_date, 1)
+        row2.addLayout(col_ob, 1)
         body_layout.addLayout(row2)
 
-        # =========== ROW 3: Customer | Order Booker ===========
+        # Row 3: Customer | PJP
         row3 = QHBoxLayout()
         row3.setSpacing(12)
 
-        # Customer
         col_customer = QVBoxLayout()
         lbl_customer = QLabel("Customer")
-        lbl_customer.setCursor(Qt.PointingHandCursor)
         self.edit_customer = QLineEdit()
         self.edit_customer.setReadOnly(True)
         self.edit_customer.setMinimumHeight(36)
-        self.edit_customer.setCursor(Qt.ArrowCursor)
         col_customer.addWidget(lbl_customer)
         col_customer.addWidget(self.edit_customer)
 
-        # Order Booker
-        col_ob = QVBoxLayout()
-        lbl_ob = QLabel("Order Booker")
-        lbl_ob.setCursor(Qt.PointingHandCursor)
-        self.edit_ob = QLineEdit()
-        self.edit_ob.setReadOnly(True)
-        self.edit_ob.setMinimumHeight(36)
-        self.edit_ob.setCursor(Qt.ArrowCursor)
-        col_ob.addWidget(lbl_ob)
-        col_ob.addWidget(self.edit_ob)
-
-        row3.addLayout(col_customer, 1)
-        row3.addLayout(col_ob, 1)
-        body_layout.addLayout(row3)
-
-        # =========== ROW 4: PJP | Invoice Amount ===========
-        row4 = QHBoxLayout()
-        row4.setSpacing(12)
-
-        # PJP
         col_pjp = QVBoxLayout()
         lbl_pjp = QLabel("PJP")
-        lbl_pjp.setCursor(Qt.PointingHandCursor)
         self.edit_pjp = QLineEdit()
         self.edit_pjp.setReadOnly(True)
         self.edit_pjp.setMinimumHeight(36)
-        self.edit_pjp.setCursor(Qt.ArrowCursor)
         col_pjp.addWidget(lbl_pjp)
         col_pjp.addWidget(self.edit_pjp)
 
-        # Invoice Amount (auto, read-only)
+        row3.addLayout(col_customer, 1)
+        row3.addLayout(col_pjp, 1)
+        body_layout.addLayout(row3)
+
+        # Row 4: Invoice Amount | Remaining Invoice Amount
+        row4 = QHBoxLayout()
+        row4.setSpacing(12)
+
         col_inv_amount = QVBoxLayout()
-        lbl_inv_amount = QLabel("Invoice Amount (PKR)")
-        lbl_inv_amount.setCursor(Qt.PointingHandCursor)
+        lbl_inv_amount = QLabel("Total Invoice Amount (PKR)")
         self.edit_invoice_amount = QLineEdit()
         self.edit_invoice_amount.setReadOnly(True)
         self.edit_invoice_amount.setMinimumHeight(36)
-        self.edit_invoice_amount.setCursor(Qt.ArrowCursor)
         col_inv_amount.addWidget(lbl_inv_amount)
         col_inv_amount.addWidget(self.edit_invoice_amount)
 
-        row4.addLayout(col_pjp, 1)
+        col_remaining = QVBoxLayout()
+        lbl_remaining = QLabel("Remaining Invoice Amount (PKR)")
+        self.edit_remaining_amount = QLineEdit()
+        self.edit_remaining_amount.setReadOnly(True)
+        self.edit_remaining_amount.setMinimumHeight(36)
+        col_remaining.addWidget(lbl_remaining)
+        col_remaining.addWidget(self.edit_remaining_amount)
+
         row4.addLayout(col_inv_amount, 1)
+        row4.addLayout(col_remaining, 1)
         body_layout.addLayout(row4)
 
-        # =========== ROW 5: Payment Amount ===========
+        # Row 5: Invoice Date | Payment Amount
         row5 = QHBoxLayout()
         row5.setSpacing(12)
 
+        col_inv_date = QVBoxLayout()
+        lbl_inv_date = QLabel("Invoice Date")
+        self.edit_invoice_date = QLineEdit()
+        self.edit_invoice_date.setReadOnly(True)
+        self.edit_invoice_date.setMinimumHeight(36)
+        col_inv_date.addWidget(lbl_inv_date)
+        col_inv_date.addWidget(self.edit_invoice_date)
+
         col_pay_amount = QVBoxLayout()
         lbl_pay_amount = QLabel("Payment Amount (PKR)")
-        lbl_pay_amount.setCursor(Qt.PointingHandCursor)
         self.edit_amount = QLineEdit()
         self.edit_amount.setPlaceholderText("Enter amount received")
         self.edit_amount.setMinimumHeight(36)
-        self.edit_amount.setCursor(Qt.PointingHandCursor)
-
         validator = QDoubleValidator(0.0, 999999999.99, 2, self)
         validator.setNotation(QDoubleValidator.StandardNotation)
         self.edit_amount.setValidator(validator)
-
         col_pay_amount.addWidget(lbl_pay_amount)
         col_pay_amount.addWidget(self.edit_amount)
 
+        row5.addLayout(col_inv_date, 1)
         row5.addLayout(col_pay_amount, 1)
-        row5.addStretch()
         body_layout.addLayout(row5)
 
         main_layout.addWidget(body)
 
-        # ---- Footer Buttons ----
         footer = QFrame()
         footer_layout = QHBoxLayout(footer)
         footer_layout.setContentsMargins(20, 8, 20, 20)
@@ -350,48 +370,31 @@ class AddPaymentDialog(QDialog):
         btn_cancel = QPushButton("Cancel")
         btn_cancel.setObjectName("DialogCancelButton")
         btn_cancel.clicked.connect(self.reject)
-        btn_cancel.setCursor(Qt.PointingHandCursor)
 
         btn_add = QPushButton("Add")
         btn_add.setObjectName("DialogPrimaryButton")
         btn_add.clicked.connect(self._on_add_clicked)
-        btn_add.setCursor(Qt.PointingHandCursor)
 
         btn_cancel.setMinimumWidth(140)
         btn_add.setMinimumWidth(140)
-
         btn_add.setDefault(False)
         btn_add.setAutoDefault(False)
         btn_cancel.setAutoDefault(False)
 
-
         footer_layout.addWidget(btn_cancel)
         footer_layout.addWidget(btn_add)
-
-
-
         main_layout.addWidget(footer)
 
     # ------------------------- Styles -------------------------
 
     def _apply_local_styles(self):
-        """Local style for Add Payment dialog."""
         if self.dark_mode:
             self.setStyleSheet(
                 """
-                QDialog {
-                    background-color: #000000;
-                }
-                QLabel {
-                    color: #e5e7eb;
-                }
-                QLabel#DialogTitle {
-                    font-size: 18px;
-                    font-weight: 600;
-                    color: #f9fafb;
-                }
-
-                QLineEdit, QDateEdit {
+                QDialog { background-color: #000000; }
+                QLabel { color: #e5e7eb; }
+                QLabel#DialogTitle { font-size: 18px; font-weight: 600; color: #f9fafb; }
+                QLineEdit, QDateEdit, QComboBox {
                     padding: 8px;
                     border-radius: 8px;
                     border: 1px solid #1a1a1a;
@@ -399,11 +402,34 @@ class AddPaymentDialog(QDialog):
                     background-color: #1E1E1E;
                     color: #e5e7eb;
                 }
-                QLineEdit:focus,
-                QDateEdit:focus {
+                QLineEdit:focus, QDateEdit:focus, QComboBox:focus {
                     border: 1px solid rgb(37, 79, 167);
                 }
+                QComboBox {
+                    padding: 8px;
+                    padding-right: 34px;
+                    border-radius: 8px;
+                    border: 1px solid #1a1a1a;
+                    min-height: 36px;
+                    background-color: #1E1E1E;
+                    color: #e5e7eb;
+                }
 
+                QComboBox::drop-down {
+                    subcontrol-origin: padding;
+                    subcontrol-position: top right;
+                    width: 30px;
+                    border-left: 1px solid #2a2a2a;
+                    background-color: #252525;
+                    border-top-right-radius: 8px;
+                    border-bottom-right-radius: 8px;
+                }
+
+                QComboBox::down-arrow {
+                    image: none;
+                    width: 0px;
+                    height: 0px;
+                }
                 QPushButton#DialogPrimaryButton {
                     background-color: rgb(37, 79, 167);
                     color: white;
@@ -412,9 +438,7 @@ class AddPaymentDialog(QDialog):
                     border: none;
                     font-weight: 500;
                 }
-                QPushButton#DialogPrimaryButton:hover {
-                    background-color: rgb(30, 64, 140);
-                }
+                QPushButton#DialogPrimaryButton:hover { background-color: rgb(30, 64, 140); }
                 QPushButton#DialogCancelButton {
                     background-color: #ef4444;
                     color: white;
@@ -423,36 +447,49 @@ class AddPaymentDialog(QDialog):
                     border: none;
                     font-weight: 500;
                 }
-                QPushButton#DialogCancelButton:hover {
-                    background-color: #b91c1c;
-                }
-                QFrame[frameShape="4"] {
-                    background-color: #1a1a1a;
-                }
+                QPushButton#DialogCancelButton:hover { background-color: #b91c1c; }
+                QFrame[frameShape="4"] { background-color: #1a1a1a; }
                 """
             )
         else:
             self.setStyleSheet(
                 """
-                QDialog {
-                    background-color: #ffffff;
-                }
-                QLabel#DialogTitle {
-                    font-size: 18px;
-                    font-weight: 600;
-                }
-
-                QLineEdit, QDateEdit {
+                QDialog { background-color: #ffffff; }
+                QLabel#DialogTitle { font-size: 18px; font-weight: 600; }
+                QLineEdit, QDateEdit, QComboBox {
                     padding: 8px;
                     border-radius: 8px;
                     border: 1px solid #d1d5db;
                     min-height: 36px;
                 }
-                QLineEdit:focus,
-                QDateEdit:focus {
+                QLineEdit:focus, QDateEdit:focus, QComboBox:focus {
                     border: 1px solid rgb(37, 79, 167);
                 }
+                QComboBox {
+                    padding: 8px;
+                    padding-right: 34px;
+                    border-radius: 8px;
+                    border: 1px solid #d1d5db;
+                    min-height: 36px;
+                    background-color: #ffffff;
+                    color: #111827;
+                }
 
+                QComboBox::drop-down {
+                    subcontrol-origin: padding;
+                    subcontrol-position: top right;
+                    width: 30px;
+                    border-left: 1px solid #d1d5db;
+                    background-color: #f9fafb;
+                    border-top-right-radius: 8px;
+                    border-bottom-right-radius: 8px;
+                }
+
+                QComboBox::down-arrow {
+                    image: none;
+                    width: 0px;
+                    height: 0px;
+                }
                 QPushButton#DialogPrimaryButton {
                     background-color: rgb(37, 79, 167);
                     color: white;
@@ -461,9 +498,7 @@ class AddPaymentDialog(QDialog):
                     border: none;
                     font-weight: 500;
                 }
-                QPushButton#DialogPrimaryButton:hover {
-                    background-color: rgb(30, 64, 140);
-                }
+                QPushButton#DialogPrimaryButton:hover { background-color: rgb(30, 64, 140); }
                 QPushButton#DialogCancelButton {
                     background-color: #ef4444;
                     color: white;
@@ -472,45 +507,118 @@ class AddPaymentDialog(QDialog):
                     border: none;
                     font-weight: 500;
                 }
-                QPushButton#DialogCancelButton:hover {
-                    background-color: #b91c1c;
-                }
+                QPushButton#DialogCancelButton:hover { background-color: #b91c1c; }
                 """
             )
 
-    # ---------------------- Invoice Lookup ----------------------
+    # ---------------------- Dropdown / lookup logic ----------------------
+
+    def _load_order_bookers(self, selected_order_booker_id: int | None = None):
+        self.combo_order_booker.blockSignals(True)
+        self.combo_order_booker.clear()
+        self.combo_order_booker.addItem("Select Order Booker", None)
+
+        try:
+            cur = self.conn.cursor()
+            cur.execute(
+                """
+                SELECT DISTINCT ob.id, ob.name
+                FROM invoices i
+                JOIN order_bookers ob ON ob.id = i.order_booker_id
+                ORDER BY ob.name COLLATE NOCASE
+                """
+            )
+            rows = cur.fetchall()
+            for row in rows:
+                ob_id = row[0] if not isinstance(row, sqlite3.Row) else row["id"]
+                ob_name = row[1] if not isinstance(row, sqlite3.Row) else row["name"]
+                self.combo_order_booker.addItem(str(ob_name or "-"), ob_id)
+
+            if selected_order_booker_id is not None:
+                for i in range(self.combo_order_booker.count()):
+                    if self.combo_order_booker.itemData(i) == selected_order_booker_id:
+                        self.combo_order_booker.setCurrentIndex(i)
+                        break
+            else:
+                self.combo_order_booker.setCurrentIndex(0)
+        finally:
+            self.combo_order_booker.blockSignals(False)
 
 
-    def _normalize_numeric_code(self, raw: str) -> str:
-        """Return digits-only code. Accepts inputs like '123', 'INV123', 'inv-123'."""
-        s = (raw or "").strip().upper()
-        if s.startswith("INV"):
-            s = s[3:]
-        s = s.strip()
-        if s.startswith("-"):
-            s = s[1:].strip()
-        # remove any remaining non-digit characters (safety)
-        s = "".join(ch for ch in s if ch.isdigit())
-        return s
-    def _on_invoice_code_changed(self, text: str):
-        """
-        Real-time lookup as user types Invoice ID.
-        No popups, just auto-fill fields if invoice exists.
-        """
-        code = self._normalize_numeric_code(text)
+    def _resolve_invoice_from_input(self, show_error: bool = False) -> bool:
+        selected_ob_id = self.combo_order_booker.currentData()
+        invoice_code = self.edit_invoice_code.text().strip()
 
-        # normalize to digits-only without infinite recursion
-        if code != (text or ""):
-            self.edit_invoice_code.blockSignals(True)
-            self.edit_invoice_code.setText(code)
-            self.edit_invoice_code.blockSignals(False)
-            return
+        self._clear_invoice_fields(clear_invoice_input=False)
 
-        if not code:
-            self._invoice_resolved = False
-            self._clear_invoice_fields()
-            return
+        if not selected_ob_id or not invoice_code:
+            if show_error:
+                if not selected_ob_id:
+                    QMessageBox.warning(self, "Validation error", "Please select Order Booker.")
+                else:
+                    QMessageBox.warning(self, "Validation error", "Please enter Invoice ID.")
+            return False
 
+        try:
+            cur = self.conn.cursor()
+            cur.execute(
+                """
+                SELECT i.id
+                FROM invoices i
+                WHERE CAST(i.invoice_code AS TEXT) = ?
+                  AND i.order_booker_id = ?
+                LIMIT 1
+                """,
+                (invoice_code, selected_ob_id),
+            )
+            row = cur.fetchone()
+        except Exception as e:
+            if show_error:
+                QMessageBox.critical(self, "Error", f"Failed to validate Invoice ID:\n{e}")
+            return False
+
+        if not row:
+            if show_error:
+                QMessageBox.warning(
+                    self,
+                    "Invalid Invoice ID",
+                    "This Invoice ID does not belong to the selected Order Booker.",
+                )
+            return False
+
+        invoice_id = row["id"] if isinstance(row, sqlite3.Row) else row[0]
+        self._populate_invoice_fields(invoice_id)
+        QTimer.singleShot(0, self._focus_payment_amount)
+        return True
+
+
+    def _invoice_payment_totals(self, invoice_id: int) -> tuple[float, float]:
+        cur = self.conn.cursor()
+        cur.execute("SELECT amount FROM invoices WHERE id = ?", (invoice_id,))
+        r = cur.fetchone()
+        inv_amt = float((r["amount"] if isinstance(r, sqlite3.Row) else r[0]) or 0.0) if r else 0.0
+
+        cur.execute("SELECT COALESCE(SUM(amount), 0) FROM payments WHERE invoice_id = ?", (invoice_id,))
+        r2 = cur.fetchone()
+        paid_amt = float((r2[0] if r2 else 0.0) or 0.0)
+        return inv_amt, paid_amt
+
+    def _remaining_amount_for_invoice(self, invoice_id: int) -> float:
+        inv_amt, paid_amt = self._invoice_payment_totals(invoice_id)
+        return max(inv_amt - paid_amt, 0.0)
+
+    def _on_order_booker_changed(self, index: int):
+        order_booker_id = self.combo_order_booker.itemData(index)
+        self._sticky_order_booker_id = order_booker_id
+        self._clear_invoice_fields(clear_invoice_input=False)
+
+        if order_booker_id is not None:
+            self._focus_invoice_input()
+
+    def _on_invoice_code_changed(self, _text: str):
+        self._clear_invoice_fields(clear_invoice_input=False)
+
+    def _populate_invoice_fields(self, invoice_id: int):
         try:
             cur = self.conn.cursor()
             cur.execute(
@@ -521,124 +629,104 @@ class AddPaymentDialog(QDialog):
                     i.invoice_date,
                     i.amount,
                     c.name AS customer_name,
+                    ob.id AS ob_id,
                     ob.name AS ob_name,
                     pj.pjp_name
                 FROM invoices i
-                LEFT JOIN customers c     ON c.id  = i.customer_id
+                LEFT JOIN customers c      ON c.id = i.customer_id
                 LEFT JOIN order_bookers ob ON ob.id = i.order_booker_id
-                LEFT JOIN pjps pj         ON pj.id = i.pjp_id
-                WHERE i.invoice_code = ?
+                LEFT JOIN pjps pj          ON pj.id = i.pjp_id
+                WHERE i.id = ?
                 """,
-                (code,),
+                (invoice_id,),
             )
             row = cur.fetchone()
         except Exception:
-            self._invoice_resolved = False
-            self._clear_invoice_fields()
+            self._clear_invoice_fields(clear_invoice_input=False)
             return
 
         if not row:
-            self._invoice_resolved = False
-            self._clear_invoice_fields()
+            self._clear_invoice_fields(clear_invoice_input=False)
             return
-        
-        self._invoice_resolved = True
 
-        (
-            invoice_id,
-            invoice_code,
-            invoice_date,
-            invoice_amount,
-            customer_name,
-            ob_name,
-            pjp_name,
-        ) = row
+        if isinstance(row, sqlite3.Row):
+            invoice_id = row["id"]
+            invoice_date = row["invoice_date"]
+            invoice_amount = row["amount"]
+            customer_name = row["customer_name"]
+            ob_id = row["ob_id"]
+            pjp_name = row["pjp_name"]
+        else:
+            invoice_id, _invoice_code, invoice_date, invoice_amount, customer_name, ob_id, _ob_name, pjp_name = row
 
         self._current_invoice_id = invoice_id
-        self._current_invoice_amount = float(invoice_amount or 0)
+        self._current_invoice_amount = float(invoice_amount or 0.0)
+        self._current_remaining_amount = self._remaining_amount_for_invoice(invoice_id)
+        self._invoice_resolved = True
 
-        # invoice date
         try:
             dti = datetime.strptime(invoice_date, "%Y-%m-%d")
             display_date = QDate(dti.year, dti.month, dti.day).toString("dd/MM/yyyy")
         except Exception:
             display_date = invoice_date or ""
 
-        self.edit_invoice_date.setText(display_date)
         self.edit_customer.setText(customer_name or "-")
-        self.edit_ob.setText(ob_name or "-")
         self.edit_pjp.setText(pjp_name or "-")
+        self.edit_invoice_date.setText(display_date)
         self.edit_invoice_amount.setText(f"{self._current_invoice_amount:,.0f}")
+        self.edit_remaining_amount.setText(f"{self._current_remaining_amount:,.0f}")
 
+        if ob_id is not None:
+            self.combo_order_booker.blockSignals(True)
+            for i in range(self.combo_order_booker.count()):
+                if self.combo_order_booker.itemData(i) == ob_id:
+                    self.combo_order_booker.setCurrentIndex(i)
+                    break
+            self.combo_order_booker.blockSignals(False)
 
-
-    def _clear_invoice_fields(self):
+    def _clear_invoice_fields(self, clear_invoice_input: bool = True):
         self._current_invoice_id = None
         self._current_invoice_amount = 0.0
-        self.edit_invoice_date.setText("")
-        self.edit_customer.setText("")
-        self.edit_ob.setText("")
-        self.edit_pjp.setText("")
-        self.edit_invoice_amount.setText("")
+        self._current_remaining_amount = 0.0
+        self._invoice_resolved = False
+        self.edit_customer.clear()
+        self.edit_pjp.clear()
+        self.edit_invoice_date.clear()
+        self.edit_invoice_amount.clear()
+        self.edit_remaining_amount.clear()
 
-    # --------------------------- Logic ---------------------------
+        if clear_invoice_input:
+            self.edit_invoice_code.clear()
 
-    
-    def _invoice_payment_totals(self, invoice_id: int) -> tuple[float, float]:
-        """
-        Returns (invoice_amount, total_paid_so_far) for a given invoice_id.
-        """
-        cur = self.conn.cursor()
+    # --------------------------- save logic ---------------------------
 
-        cur.execute("SELECT amount FROM invoices WHERE id = ?", (invoice_id,))
-        r = cur.fetchone()
-        inv_amt = float((r["amount"] if isinstance(r, sqlite3.Row) else r[0]) or 0.0) if r else 0.0
-
-        cur.execute("SELECT COALESCE(SUM(amount), 0) FROM payments WHERE invoice_id = ?", (invoice_id,))
-        r2 = cur.fetchone()
-        paid_amt = float((r2[0] if r2 else 0.0) or 0.0)
-
-        return inv_amt, paid_amt
-
-    
     def _on_add_clicked(self):
-        """
-        Insert payment row into DB.
-        Requires a valid invoice (resolved) and positive amount.
-        """
-        if not self._current_invoice_id:
+        if not self._resolve_invoice_from_input(show_error=True):
             QMessageBox.warning(
                 self,
                 "Validation error",
-                "Please enter a valid Invoice ID that exists in the system.",
+                "Please enter a valid Invoice ID for the selected Order Booker.",
             )
             return
 
         payment_date_iso = self.date_payment.date().toString("yyyy-MM-dd")
-
         amount_text = self.edit_amount.text().strip()
         amount = float(amount_text) if amount_text else 0.0
 
         if amount <= 0:
-            QMessageBox.warning(
-                self,
-                "Validation error",
-                "Payment amount must be greater than zero.",
-            )
+            QMessageBox.warning(self, "Validation error", "Payment amount must be greater than zero.")
             return
-        
 
-        # ---- NEW: prevent extra payment if invoice already fully paid / overpayment ----
         inv_amt, paid_amt = self._invoice_payment_totals(self._current_invoice_id)
-
 
         if inv_amt > 0 and paid_amt >= inv_amt:
             QMessageBox.warning(
                 self,
                 "Not allowed",
                 f"This invoice is already fully paid.\n\n"
-                f"Invoice Amount: {inv_amt:,.0f} PKR\n"
+                f"Total Invoice Amount: {inv_amt:,.0f} PKR\n"
                 f"Paid: {paid_amt:,.0f} PKR",
+
             )
             return
 
@@ -652,27 +740,21 @@ class AddPaymentDialog(QDialog):
             )
             return
 
-
-        # ✅ Generate independent numeric Payment ID here (NOT inside the if block)
         cur = self.conn.cursor()
-
         cur.execute("SELECT value FROM payment_meta WHERE key = 'payment_last_number'")
         last_no = cur.fetchone()[0]
-
         new_no = last_no + 1
-        payment_code = new_no  # keep as INTEGER
+        payment_code = new_no
 
         cur.execute(
             "UPDATE payment_meta SET value = ? WHERE key = 'payment_last_number'",
             (new_no,),
         )
 
-        # Optional: show it in the UI
         self.edit_payment_code.setText(str(payment_code))
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         try:
-            cur = self.conn.cursor()
             cur.execute(
                 """
                 INSERT INTO payments (
@@ -688,34 +770,17 @@ class AddPaymentDialog(QDialog):
                 (payment_code, payment_date_iso, self._current_invoice_id, amount, now_str),
             )
             self.conn.commit()
-
         except sqlite3.IntegrityError as e:
             QMessageBox.warning(
                 self,
                 "Error",
-                f"Could not add payment. It may already exist for this Invoice ID "
-                f"or the Payment ID is not unique.\n\n{e}",
+                f"Could not add payment. It may already exist for this Invoice ID or the Payment ID is not unique.\n\n{e}",
             )
             return
         except Exception as e:
-            QMessageBox.critical(
-                self,
-                "Error",
-                f"Unexpected error while saving payment:\n\n{e}",
-            )
+            QMessageBox.critical(self, "Error", f"Unexpected error while saving payment:\n\n{e}")
             return
 
-        # --- SUCCESS ---
-
-        # 1) Show green banner
         self._show_success_banner("Payment added successfully")
-
-        # 2) Emit signal to refresh Manage view
         self.payment_added.emit()
-
-        # 3) Clear form for next entry
-        self.edit_invoice_code.clear()  # This triggers _on_invoice_code_changed which clears fields
-        self.edit_amount.clear()
-        self.date_payment.setDate(QDate.currentDate())
-        self.edit_invoice_code.setFocus()
-        self._preview_next_payment_id()
+        self.reset_form(auto_open_order_booker=True, preserve_order_booker=True)

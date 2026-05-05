@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
     QWidget,
     QMessageBox,
     QSizePolicy,
+    QLineEdit,
 )
 from PySide6.QtCore import Qt, Signal, QTimer
 from PySide6.QtGui import QCursor
@@ -145,6 +146,7 @@ class ManageCustomersDialog(QDialog):
         self._apply_styles()
         self.rows = []
         self.page_size = 10
+        self._search_customer_name = ""
 
         # Load customers after the dialog is shown, so UI feels instant
         QTimer.singleShot(0, self.load_customers)
@@ -164,7 +166,20 @@ class ManageCustomersDialog(QDialog):
         title = QLabel("Manage Customers")
         title.setObjectName("ManageTitle")
         h_layout.addWidget(title)
+
         h_layout.addStretch()
+
+        self.edit_search = QLineEdit()
+        self.edit_search.setObjectName("CustomerSearch")
+        self.edit_search.setPlaceholderText("Search Customer Name")
+        self.edit_search.setClearButtonEnabled(True)
+        self.edit_search.setFixedWidth(240)
+        self.edit_search.setFocusPolicy(Qt.StrongFocus)
+        self.edit_search.returnPressed.connect(self._apply_search)
+        self.edit_search.textChanged.connect(self._on_search_text_changed)
+
+        h_layout.addWidget(self.edit_search)
+
         layout.addWidget(header)
 
         # Scroll area with rows
@@ -198,10 +213,16 @@ class ManageCustomersDialog(QDialog):
         add_btn.setCursor(QCursor(Qt.PointingHandCursor))
         add_btn.clicked.connect(self.open_add_customer)
 
+        # Prevent Enter in the search box from triggering this button
+        add_btn.setDefault(False)
+        add_btn.setAutoDefault(False)
+
         close_footer = QPushButton("Close")
         close_footer.setObjectName("CloseBtn")
         close_footer.setCursor(QCursor(Qt.PointingHandCursor))
         close_footer.clicked.connect(self.reject)
+        close_footer.setDefault(False)
+        close_footer.setAutoDefault(False)
 
         f_layout.addWidget(add_btn)
         f_layout.addStretch()
@@ -209,6 +230,22 @@ class ManageCustomersDialog(QDialog):
         layout.addWidget(footer)
 
     # ----- load + build rows -----------------------------------------
+
+    def _normalize_customer_search(self, text: str) -> str:
+        """Normalize search text for robust name matching."""
+        return " ".join((text or "").strip().casefold().split())
+
+    def _apply_search(self):
+        self._search_customer_name = self._normalize_customer_search(self.edit_search.text())
+        self.load_customers()
+
+    def _on_search_text_changed(self, text: str):
+        normalized = self._normalize_customer_search(text)
+
+        # reload immediately when cleared
+        if not normalized:
+            self._search_customer_name = ""
+            self.load_customers()
 
     def load_customers(self):
         """Reload customers with lazy loading (keyset pagination)."""
@@ -241,12 +278,24 @@ class ManageCustomersDialog(QDialog):
             FROM customers c
             LEFT JOIN pjps pj ON pj.id = c.pjp_id
             LEFT JOIN order_bookers ob ON ob.id = pj.order_booker_id
+            WHERE 1=1
         """
         params = []
+
+        # Robust name search:
+        # - case-insensitive
+        # - trims repeated spaces from input
+        # - supports multi-word search by requiring all tokens
+        if self._search_customer_name:
+            tokens = [tok for tok in self._search_customer_name.split(" ") if tok]
+            for tok in tokens:
+                query += " AND LOWER(COALESCE(c.name, '')) LIKE ?"
+                params.append(f"%{tok}%")
+
         if cursor_key:
             last_ob, last_pjp, last_cust, last_id = cursor_key
             query += """
-                WHERE (
+                AND (
                     COALESCE(ob.name,'') > ?
                     OR (COALESCE(ob.name,'') = ? AND COALESCE(pj.pjp_name,'') > ?)
                     OR (COALESCE(ob.name,'') = ? AND COALESCE(pj.pjp_name,'') = ? AND c.name > ?)

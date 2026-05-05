@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
     QFileDialog,
 )
+
 from PySide6.QtCore import (
     Qt,
     QDate,
@@ -33,7 +34,8 @@ from PySide6.QtCore import (
     QUrl,
     QTimer,
 )
-from PySide6.QtGui import QCursor, QIcon, QStandardItemModel, QStandardItem, QDesktopServices
+
+from PySide6.QtGui import QCursor, QIcon, QStandardItemModel, QStandardItem, QDesktopServices, QAction
 
 import tempfile
 import zipfile
@@ -1519,6 +1521,19 @@ class LedgerDialog(QDialog):
 
 
         table_header_row.addStretch()
+
+        self.edit_ref_search = QLineEdit()
+        self.edit_ref_search.setObjectName("LedgerRefSearch")
+        self.edit_ref_search.setPlaceholderText("Search Invoice/Payment ID")
+        self.edit_ref_search.setClearButtonEnabled(True)
+        self.edit_ref_search.setFixedWidth(260)
+        self.edit_ref_search.returnPressed.connect(self._refresh_ledger)
+        self.edit_ref_search.textChanged.connect(self._on_ref_search_changed)
+
+        search_action = QAction("🔍", self.edit_ref_search)
+        self.edit_ref_search.addAction(search_action, QLineEdit.LeadingPosition)
+
+        table_header_row.addWidget(self.edit_ref_search)
         table_header_row.addWidget(self.btn_download_invoice)
         table_header_row.addWidget(self.btn_download_report)
         table_header_row.addWidget(self.btn_print_report)
@@ -1704,6 +1719,20 @@ class LedgerDialog(QDialog):
 
         self._load_customers(None)
 
+    def _normalize_ref_search(self, raw: str) -> str:
+        s = (raw or "").strip().upper()
+        if s.startswith("INV"):
+            s = s[3:]
+        elif s.startswith("PAY"):
+            s = s[3:]
+        s = "".join(ch for ch in s if ch.isdigit())
+        return s
+
+    def _on_ref_search_changed(self, text: str):
+        text = (text or "").strip()
+        if not text:
+            self._refresh_ledger()
+
     def _on_pjp_changed(self, index: int):
         pjp_id = self.combo_pjp.itemData(index, Qt.UserRole)
         self._load_customers(pjp_id)
@@ -1739,6 +1768,9 @@ class LedgerDialog(QDialog):
         # Force reload dependent dropdowns (PJP + Customer) back to full lists
         self._load_pjps(None)  # also reloads customers
 
+        if hasattr(self, "edit_ref_search"):
+            self.edit_ref_search.clear()
+
         # Refresh the ledger
         self._refresh_ledger()
 
@@ -1765,9 +1797,8 @@ class LedgerDialog(QDialog):
         self._reset_pagination()
 
         # Recompute summary totals for the *full filtered set*
-        invoiced, paid = self._compute_summary_totals()
-        outstanding = (invoiced or 0) - (paid or 0)
-        self._update_summary_cards(invoiced or 0, paid or 0, outstanding)
+        invoiced, paid, outstanding = self._compute_summary_totals()
+        self._update_summary_cards(invoiced or 0, paid or 0, outstanding or 0)
 
 
         # Load first page
@@ -1784,7 +1815,11 @@ class LedgerDialog(QDialog):
         to_q = self.date_to.date()
         to_date = None if to_q == self.date_to.minimumDate() else to_q.toString("yyyy-MM-dd")
 
-        return ob_id, pjp_id, customer_id, from_date, to_date
+        ref_search = None
+        if hasattr(self, "edit_ref_search"):
+            ref_search = self._normalize_ref_search(self.edit_ref_search.text())
+
+        return ob_id, pjp_id, customer_id, from_date, to_date, ref_search
 
     def _reset_pagination(self):
         self._cursor_key = None
@@ -1793,24 +1828,38 @@ class LedgerDialog(QDialog):
         self._running_balance = 0.0
 
     def _clear_rows(self):
-        # Keep the header row at index 0
-        while self.container_layout.count() > 1:
-            item = self.container_layout.takeAt(1)
+        # Keep:
+        #   index 0 = table header
+        #   index 1 = empty_label
+        while self.container_layout.count() > 2:
+            item = self.container_layout.takeAt(2)
             w = item.widget()
             if w is not None:
                 w.deleteLater()
+
         self.rows = []
-        if hasattr(self, "empty_label") and self.empty_label:
+
+        if hasattr(self, "empty_label") and self.empty_label is not None:
             self.empty_label.setVisible(False)
 
 
-    def _compute_summary_totals(self) -> tuple[float, float]:
-        """Compute totals for the full filtered set (fast aggregate queries)."""
-        ob_id, pjp_id, customer_id, from_date, to_date = self._current_filters()
+    def _compute_summary_totals(self) -> tuple[float, float, float]:
+        """
+        Returns:
+        - invoiced_in_period  : invoices whose invoice_date is within From..To
+        - paid_in_period      : payments whose payment_date is within From..To
+        - outstanding_as_of_to: all invoices <= To minus all payments <= To
+        """
+        ob_id, pjp_id, customer_id, from_date, to_date, ref_search = self._current_filters()
+        cur = self.conn.cursor()
 
-        # invoices total
-        inv_q = "SELECT COALESCE(SUM(i.amount),0) FROM invoices i WHERE i.in_ledger = 1"
+        # -----------------------------
+        # 1) Invoiced in selected period
+        # -----------------------------
+        inv_q = "SELECT COALESCE(SUM(i.amount), 0) FROM invoices i WHERE i.in_ledger = 1"
         inv_p = []
+        
+
         if customer_id:
             inv_q += " AND i.customer_id = ?"
             inv_p.append(customer_id)
@@ -1820,6 +1869,11 @@ class LedgerDialog(QDialog):
         elif ob_id:
             inv_q += " AND i.pjp_id IN (SELECT id FROM pjps WHERE order_booker_id = ?)"
             inv_p.append(ob_id)
+
+        if ref_search:
+            inv_q += " AND CAST(i.invoice_code AS TEXT) = ?"
+            inv_p.append(ref_search)
+
         if from_date:
             inv_q += " AND i.invoice_date >= ?"
             inv_p.append(from_date)
@@ -1827,15 +1881,18 @@ class LedgerDialog(QDialog):
             inv_q += " AND i.invoice_date <= ?"
             inv_p.append(to_date)
 
-        # payments total (filters based on linked invoice)
+        # -----------------------------
+        # 2) Payments in selected period
+        # -----------------------------
         pay_q = """
-            SELECT COALESCE(SUM(p.amount),0)
+            SELECT COALESCE(SUM(p.amount), 0)
             FROM payments p
             JOIN invoices i ON i.id = p.invoice_id
             LEFT JOIN pjps pj ON pj.id = i.pjp_id
             WHERE p.in_ledger = 1 AND i.in_ledger = 1
         """
         pay_p = []
+
         if customer_id:
             pay_q += " AND i.customer_id = ?"
             pay_p.append(customer_id)
@@ -1845,6 +1902,11 @@ class LedgerDialog(QDialog):
         elif ob_id:
             pay_q += " AND pj.order_booker_id = ?"
             pay_p.append(ob_id)
+
+        if ref_search:
+            pay_q += " AND CAST(p.payment_code AS TEXT) = ?"
+            pay_p.append(ref_search)
+            
         if from_date:
             pay_q += " AND p.payment_date >= ?"
             pay_p.append(from_date)
@@ -1852,24 +1914,88 @@ class LedgerDialog(QDialog):
             pay_q += " AND p.payment_date <= ?"
             pay_p.append(to_date)
 
-        cur = self.conn.cursor()
+        # -----------------------------
+        # 3) Outstanding as of TO date
+        #    = all invoices <= To - all payments <= To
+        # -----------------------------
+        close_inv_q = "SELECT COALESCE(SUM(i.amount), 0) FROM invoices i WHERE i.in_ledger = 1"
+        close_inv_p = []
+
+        if customer_id:
+            close_inv_q += " AND i.customer_id = ?"
+            close_inv_p.append(customer_id)
+        elif pjp_id:
+            close_inv_q += " AND i.pjp_id = ?"
+            close_inv_p.append(pjp_id)
+        elif ob_id:
+            close_inv_q += " AND i.pjp_id IN (SELECT id FROM pjps WHERE order_booker_id = ?)"
+            close_inv_p.append(ob_id)
+
+        if ref_search:
+            close_inv_q += " AND CAST(i.invoice_code AS TEXT) = ?"
+            close_inv_p.append(ref_search)
+
+        if to_date:
+            close_inv_q += " AND i.invoice_date <= ?"
+            close_inv_p.append(to_date)
+
+        close_pay_q = """
+            SELECT COALESCE(SUM(p.amount), 0)
+            FROM payments p
+            JOIN invoices i ON i.id = p.invoice_id
+            LEFT JOIN pjps pj ON pj.id = i.pjp_id
+            WHERE p.in_ledger = 1 AND i.in_ledger = 1
+        """
+        close_pay_p = []
+
+        if customer_id:
+            close_pay_q += " AND i.customer_id = ?"
+            close_pay_p.append(customer_id)
+        elif pjp_id:
+            close_pay_q += " AND i.pjp_id = ?"
+            close_pay_p.append(pjp_id)
+        elif ob_id:
+            close_pay_q += " AND pj.order_booker_id = ?"
+            close_pay_p.append(ob_id)
+
+        if ref_search:
+            close_pay_q += " AND CAST(p.payment_code AS TEXT) = ?"
+            close_pay_p.append(ref_search)
+
+        if to_date:
+            close_pay_q += " AND p.payment_date <= ?"
+            close_pay_p.append(to_date)
+
         try:
             cur.execute(inv_q, inv_p)
-            invoiced = float((cur.fetchone() or [0])[0] or 0)
+            invoiced = float((cur.fetchone() or [0])[0] or 0.0)
         except Exception:
             invoiced = 0.0
 
         try:
             cur.execute(pay_q, pay_p)
-            paid = float((cur.fetchone() or [0])[0] or 0)
+            paid = float((cur.fetchone() or [0])[0] or 0.0)
         except Exception:
             paid = 0.0
 
-        return invoiced, paid
+        try:
+            cur.execute(close_inv_q, close_inv_p)
+            closing_invoiced = float((cur.fetchone() or [0])[0] or 0.0)
+        except Exception:
+            closing_invoiced = 0.0
+
+        try:
+            cur.execute(close_pay_q, close_pay_p)
+            closing_paid = float((cur.fetchone() or [0])[0] or 0.0)
+        except Exception:
+            closing_paid = 0.0
+
+        outstanding = closing_invoiced - closing_paid
+        return invoiced, paid, outstanding
 
     def _fetch_transactions_page(self, cursor_key):
         """Fetch a single page of transactions using keyset pagination."""
-        ob_id, pjp_id, customer_id, from_date, to_date = self._current_filters()
+        ob_id, pjp_id, customer_id, from_date, to_date, ref_search = self._current_filters()
 
         inv_query = """
             SELECT
@@ -1900,6 +2026,10 @@ class LedgerDialog(QDialog):
         elif ob_id:
             inv_query += " AND pj.order_booker_id = ?"
             inv_params.append(ob_id)
+
+        if ref_search:
+            inv_query += " AND CAST(i.invoice_code AS TEXT) = ?"
+            inv_params.append(ref_search)
 
         if from_date:
             inv_query += " AND i.invoice_date >= ?"
@@ -1939,7 +2069,12 @@ class LedgerDialog(QDialog):
             pay_query += " AND pj.order_booker_id = ?"
             pay_params.append(ob_id)
 
+        if ref_search:
+            pay_query += " AND (CAST(p.payment_code AS TEXT) = ? OR CAST(i.invoice_code AS TEXT) = ?)"
+            pay_params.extend([ref_search, ref_search])
+
         if from_date:
+
             pay_query += " AND p.payment_date >= ?"
             pay_params.append(from_date)
         if to_date:
@@ -2089,7 +2224,7 @@ class LedgerDialog(QDialog):
           tx_date, tx_created_at, kind_sort (payment=0, invoice=1), tx_id
         cursor_key is a tuple: (tx_date, tx_created_at, kind_sort, tx_id)
         """
-        ob_id, pjp_id, customer_id, from_date, to_date = self._current_filters()
+        ob_id, pjp_id, customer_id, from_date, to_date, ref_search = self._current_filters()
 
         inv_query = """
             SELECT
@@ -2121,6 +2256,10 @@ class LedgerDialog(QDialog):
         elif ob_id:
             inv_query += " AND pj.order_booker_id = ?"
             inv_params.append(ob_id)
+
+        if ref_search:
+            inv_query += " AND CAST(i.invoice_code AS TEXT) = ?"
+            inv_params.append(ref_search)
 
         if from_date:
             inv_query += " AND i.invoice_date >= ?"
@@ -2161,6 +2300,10 @@ class LedgerDialog(QDialog):
         elif ob_id:
             pay_query += " AND pj.order_booker_id = ?"
             pay_params.append(ob_id)
+
+        if ref_search:
+            pay_query += " AND CAST(p.payment_code AS TEXT) = ?"
+            pay_params.append(ref_search)
 
         if from_date:
             pay_query += " AND p.payment_date >= ?"
@@ -2471,6 +2614,19 @@ class LedgerDialog(QDialog):
                 color: {text};
             }}
 
+            QLineEdit#LedgerRefSearch {{
+                min-height: 36px;
+                padding: 8px 10px;
+                padding-left: 34px;
+                border-radius: 8px;
+                border: 1px solid {border};
+                background-color: {bg};
+                color: {text};
+            }}
+
+            QLineEdit#LedgerRefSearch:focus {{
+                border: 1px solid {primary};
+            }}
             QListView#ComboPopupList {{
                 background-color: {bg};
                 color: {text};

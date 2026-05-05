@@ -69,7 +69,7 @@ class EditPJPDialog(AddPJPDialog):
         # Name & day
         self.edit_pjp_name.setText(p["pjp_name"])
         # Set day combo (if present)
-        idx = self.combo_day.findText(p["day_of_week"])
+        idx = self.combo_day.findText(p.get("day_of_week", ""))
         if idx >= 0:
             self.combo_day.setCurrentIndex(idx)
 
@@ -215,9 +215,9 @@ class ManagePJPsDialog(QDialog):
 
     def _fetch_page(self, cursor_key):
         query = """
-            SELECT p.id, p.pjp_name, p.order_booker_id, ob.name AS ob_name
-            FROM pjps p
-            LEFT JOIN order_bookers ob ON ob.id = p.order_booker_id
+        SELECT p.id, p.pjp_name, p.order_booker_id, p.day_of_week, ob.name AS ob_name
+        FROM pjps p
+        LEFT JOIN order_bookers ob ON ob.id = p.order_booker_id
         """
         params = []
         if cursor_key:
@@ -267,8 +267,12 @@ class ManagePJPsDialog(QDialog):
             start_idx = len(self.rows) + 1
             for off, row in enumerate(rows):
                 data = dict(row) if isinstance(row, sqlite3.Row) else {
-                    "id": row[0], "pjp_name": row[1], "order_booker_id": row[2], "ob_name": row[3]
-                }
+                "id": row[0],
+                "pjp_name": row[1],
+                "order_booker_id": row[2],
+                "day_of_week": row[3],
+                "ob_name": row[4],
+            }
                 data["row_number"] = start_idx + off
                 self._add_pjp_row(data)
                 self.rows.append(data)  # store data, not widgets
@@ -278,8 +282,7 @@ class ManagePJPsDialog(QDialog):
             if isinstance(last, sqlite3.Row):
                 self._cursor_key = (last["ob_name"] or "", last["pjp_name"] or "", int(last["id"]))
             else:
-                self._cursor_key = (last[3] or "", last[1] or "", int(last[0]))
-
+                self._cursor_key = (last[4] or "", last[1] or "", int(last[0]))
             if len(rows) < int(self.page_size):
                 self._has_more = False
         finally:

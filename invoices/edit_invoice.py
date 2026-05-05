@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
     QToolTip,
     QToolButton,
     QMenu,
+    QLineEdit,
 )
 from PySide6.QtCore import Qt, QDate, QSize
 from PySide6.QtGui import QCursor, QIcon
@@ -370,6 +371,8 @@ class ManageInvoicesDialog(QDialog):
         self._total_count = 0
         self._total_amount = 0.0
 
+        self._search_invoice_code = ""
+
         self._build_ui()
         self._apply_styles()
         self.load_invoices()
@@ -392,7 +395,19 @@ class ManageInvoicesDialog(QDialog):
         title = QLabel(title_text)
         title.setObjectName("InvoicesTitle")
         h_layout.addWidget(title)
+
         h_layout.addStretch()
+
+        self.edit_search = QLineEdit()
+        self.edit_search.setObjectName("InvoiceSearch")
+        self.edit_search.setPlaceholderText("Search Invoice ID")
+        self.edit_search.setClearButtonEnabled(True)
+        self.edit_search.setFixedWidth(220)
+        self.edit_search.returnPressed.connect(self._apply_search)
+        self.edit_search.textChanged.connect(self._on_search_text_changed)
+
+        h_layout.addWidget(self.edit_search)
+
         main_layout.addWidget(header)
 
         scroll = QScrollArea()
@@ -449,6 +464,9 @@ class ManageInvoicesDialog(QDialog):
         self.btn_add_invoice.setObjectName("AddInvoiceBtn")
         self.btn_add_invoice.setCursor(QCursor(Qt.PointingHandCursor))
         self.btn_add_invoice.clicked.connect(self.add_invoice)
+
+        self.btn_add_invoice.setDefault(False)
+        self.btn_add_invoice.setAutoDefault(False)
 
         self.btn_delete_selected = QPushButton("Delete Selected")
         self.btn_delete_selected.setObjectName("DeleteSelectedBtn")
@@ -558,6 +576,18 @@ class ManageInvoicesDialog(QDialog):
 
     # ---------------- data load ----------------
 
+    def _normalize_invoice_search(self, text: str) -> str:
+        return "".join(ch for ch in (text or "").strip() if ch.isdigit())
+
+    def _apply_search(self):
+        self._search_invoice_code = self._normalize_invoice_search(self.edit_search.text())
+        self.load_invoices()
+
+    def _on_search_text_changed(self, text: str):
+        if not (text or "").strip():
+            self._search_invoice_code = ""
+            self.load_invoices()
+
     def _set_sort_mode(self, mode: str):
         self.sort_mode = mode
         self.load_invoices()
@@ -593,9 +623,7 @@ class ManageInvoicesDialog(QDialog):
         self._is_loading = False
 
     def _compute_totals(self) -> tuple[int, float]:
-        # No UI filters exist in this dialog; keep it simple + fast
         if self.mode == "edit":
-
             query = """
                 SELECT COUNT(*) AS cnt, COALESCE(SUM(amount), 0) AS total_amount
                 FROM invoices
@@ -608,9 +636,14 @@ class ManageInvoicesDialog(QDialog):
                 WHERE COALESCE(in_ledger, 0) = 1
             """
 
+        params = []
+        if self._search_invoice_code:
+            query += " AND CAST(invoice_code AS TEXT) = ?"
+            params.append(self._search_invoice_code)
+
         try:
             cur = self.conn.cursor()
-            cur.execute(query)
+            cur.execute(query, params)
             r = cur.fetchone()
             cnt = int(r["cnt"] or 0) if r else 0
             total = float(r["total_amount"] or 0) if r else 0.0
@@ -638,12 +671,17 @@ class ManageInvoicesDialog(QDialog):
         """
 
         # filter by ledger membership based on mode
+
         if self.mode == "edit":
             query += " AND COALESCE(i.in_ledger, 0) = 0"
         else:  # manage
             query += " AND COALESCE(i.in_ledger, 0) = 1"
 
         params = []
+
+        if self._search_invoice_code:
+            query += " AND CAST(i.invoice_code AS TEXT) = ?"
+            params.append(self._search_invoice_code)
 
         sort_mode = getattr(self, "sort_mode", "newest")
 
